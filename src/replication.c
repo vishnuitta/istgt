@@ -750,6 +750,8 @@ get_non_quorum_replica_count(spec_t *spec)
  * the number of already connected replicas.
  * There is a max limit of MAXREPLICA on the number of connected replicas
  * This functions returns true if it can be allowed, else, false
+ * This should also return false if replication_factor number of quorum replicas
+ * are connected.
  */
 static bool
 can_replica_connected(spec_t *spec, replica_t *replica)
@@ -1314,8 +1316,12 @@ handle_snap_create_resp(replica_t *replica, mgmt_cmd_t *mgmt_cmd)
 		MTX_LOCK(&replica->spec->rq_mtx);
 		hr = replica->spec->rebuild_info.healthy_replica;
 		dr = replica->spec->rebuild_info.dw_replica;
-		if (replica == hr)
+		if (replica == hr) {
+			REPLICA_ERRLOG("Disconnecting dw replica (%lu) "
+			   "as its healthy replica (%lu) errored snap_create\n",
+			    dr->zvol_guid, hr->zvol_guid);
 			inform_mgmt_conn(dr);
+		}
 		MTX_UNLOCK(&replica->spec->rq_mtx);
 	}
 	MTX_LOCK(&rcomm_mgmt->mtx);
@@ -1397,8 +1403,14 @@ disconnect_nonresponding_replica(replica_t *replica, uint64_t io_seq,
 			 */
 			hr = replica->spec->rebuild_info.healthy_replica;
 			dr = replica->spec->rebuild_info.dw_replica;
-			if (replica == hr)
+			if (replica == hr) {
+				REPLICA_ERRLOG("Disconnecting dw replica (%lu) "
+				   "as its healthy replica (%lu) not responded snap_create\n",
+				    dr->zvol_guid, hr->zvol_guid);
 				inform_mgmt_conn(dr);
+			}
+			REPLICA_ERRLOG("Disconnecting replica (%lu) as its not responded for"
+			   " snap_create\n", replica->zvol_guid);
 			inform_mgmt_conn(replica);
 			break;
 		}
@@ -1907,6 +1919,7 @@ update_replica_status(spec_t *spec, replica_t *replica)
 			/* master_replica became healthy*/
 			TAILQ_FOREACH(r1, &(spec->rq), r_next) {
 				if (r1 == replica) {
+					assert(replica->quorum == 1);
 					found_in_list = 1;
 					break;
 				}
@@ -1915,6 +1928,7 @@ update_replica_status(spec_t *spec, replica_t *replica)
 			if (r1 == NULL) {
 				TAILQ_FOREACH(r1, &(spec->non_quorum_rq), r_non_quorum_next) {
 					if (r1 == replica) {
+						assert(replica->quorum == 0);
 						found_in_list = 2;
 						break;
 					}
@@ -1922,21 +1936,38 @@ update_replica_status(spec_t *spec, replica_t *replica)
 			}
 
 			assert(r1 != NULL);
-			if (found_in_list == 1)
-				spec->degraded_rcount--;
-			spec->healthy_rcount++;
-			if (found_in_list == 2) {
-				TAILQ_REMOVE(&spec->non_quorum_rq, replica, r_non_quorum_next);
-				TAILQ_INSERT_TAIL(&spec->rq, replica, r_next);
-			}
-			replica->quorum = 1;
 			assert(spec->rebuild_info.dw_replica == replica);
 			spec->rebuild_info.dw_replica = NULL;
 			spec->rebuild_info.healthy_replica = NULL;
 			spec->rebuild_info.rebuild_in_progress = false;
+			if (found_in_list == 2) {
+				replica_count = spec->healthy_rcount + spec->degraded_rcount;
+				/* Error our if already quorum replicas are connected */
+				if (replica_count >= spec->replication_factor)
+					goto disconnect_all_non_quorum_replicas;
+			}
+			if (found_in_list == 1)
+				spec->degraded_rcount--;
+			else {
+				TAILQ_REMOVE(&spec->non_quorum_rq, replica, r_non_quorum_next);
+				TAILQ_INSERT_TAIL(&spec->rq, replica, r_next);
+			}
+			spec->healthy_rcount++;
+			replica->quorum = 1;
 			REPLICA_ERRLOG("Replica(%lu) marked healthy,"
 		    	    " seting master_replica to NULL\n",
 			    replica->zvol_guid);
+			/* Error our if already quorum replicas are connected */
+			if (spec->healthy_rcount >= spec->replication_factor) {
+				assert(spec->degraded_rcount == 0);
+disconnect_all_non_quorum_replicas:
+				TAILQ_FOREACH(r1, &(spec->non_quorum_rq), r_non_quorum_next) {
+					REPLICA_NOTICELOG("Disconnecting non-quorum (%lu) "
+					    "as healthy: %d degraded: %d quorum replicas are available",
+					    r1->zvol_guid, spec->healthy_rcount, spec->degraded_rcount);
+					inform_mgmt_conn(r1);
+				}
+			}
 		}
 	} else if ((repl_status->state == ZVOL_STATUS_DEGRADED) &&
 	    (repl_status->rebuild_status == ZVOL_REBUILDING_FAILED) &&
